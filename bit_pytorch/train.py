@@ -23,13 +23,18 @@ import numpy as np
 import torch
 import torchvision as tv
 
-import bit_pytorch.fewshot as fs
-import bit_pytorch.lbtoolbox as lb
-import bit_pytorch.models as models
+import fewshot as fs
+import lbtoolbox as lb
+import models
+
+#import bit_pytorch.fewshot as fs
+#import bit_pytorch.lbtoolbox as lb
+#import bit_pytorch.models as models
 
 import bit_common
 import bit_hyperrule
 
+#from .. import bit_common, bit_hyperrule
 
 def topk(output, target, ks=(1,)):
   """Returns one boolean vector for each k, whether the target is within the output's top-k."""
@@ -49,15 +54,19 @@ def recycle(iterable):
 def mktrainval(args, logger):
   """Returns train and validation datasets."""
   precrop, crop = bit_hyperrule.get_resolution_from_dataset(args.dataset)
+
   train_tx = tv.transforms.Compose([
-      tv.transforms.Resize((precrop, precrop)),
-      tv.transforms.RandomCrop((crop, crop)),
+      tv.transforms.Resize((896, 896)),
+      #tv.transforms.Resize((precrop, precrop)),
+      #tv.transforms.RandomCrop((crop, crop)),
       tv.transforms.RandomHorizontalFlip(),
       tv.transforms.ToTensor(),
       tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
   ])
+
   val_tx = tv.transforms.Compose([
-      tv.transforms.Resize((crop, crop)),
+      tv.transforms.Resize((896, 896)),
+      #tv.transforms.Resize((crop, crop)),
       tv.transforms.ToTensor(),
       tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
   ])
@@ -84,7 +93,7 @@ def mktrainval(args, logger):
   logger.info(f"Using a training set with {len(train_set)} images.")
   logger.info(f"Using a validation set with {len(valid_set)} images.")
 
-  micro_batch_size = args.batch // args.batch_split
+  micro_batch_size = args.batch_size // args.batch_split
 
   valid_loader = torch.utils.data.DataLoader(
       valid_set, batch_size=micro_batch_size, shuffle=False,
@@ -162,13 +171,15 @@ def main(args):
   # Only good if sizes stay the same within the main loop!
   torch.backends.cudnn.benchmark = True
 
-  device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   logger.info(f"Going to train on {device}")
+
+  classes = 5
 
   train_set, valid_set, train_loader, valid_loader = mktrainval(args, logger)
 
   logger.info(f"Loading model from {args.model}.npz")
-  model = models.KNOWN_MODELS[args.model](head_size=len(valid_set.classes), zero_head=True)
+  model = models.KNOWN_MODELS[args.model](head_size=classes, zero_head=True)
   model.load_from(np.load(f"{args.model}.npz"))
 
   logger.info("Moving model onto all GPUs")
@@ -201,6 +212,7 @@ def main(args):
 
   model.train()
   mixup = bit_hyperrule.get_mixup(len(train_set))
+  #mixup = -1
   cri = torch.nn.CrossEntropyLoss().to(device)
 
   logger.info("Starting training!")
