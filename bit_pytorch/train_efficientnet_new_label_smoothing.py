@@ -35,42 +35,10 @@ import sys
 import bit_common
 import bit_hyperrule
 import tqdm
+from efficientnet_pytorch import EfficientNet
+import torch.nn.functional as F
 
 #from .. import bit_common, bit_hyperrule
-
-def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
-    # return positive, negative label smoothing BCE targets
-    return 1.0 - 0.5 * eps, 0.5 * eps
-
-class FocalLoss(nn.Module):
-    # Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)
-    def __init__(self, loss_fcn, gamma=1.5, alpha=0.25):
-        super(FocalLoss, self).__init__()
-        self.loss_fcn = loss_fcn  # must be nn.BCEWithLogitsLoss()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.reduction = loss_fcn.reduction
-        self.loss_fcn.reduction = 'none'  # required to apply FL to each element
-
-    def forward(self, pred, true):
-        loss = self.loss_fcn(pred, true)
-        # p_t = torch.exp(-loss)
-        # loss *= self.alpha * (1.000001 - p_t) ** self.gamma  # non-zero power for gradient stability
-
-        # TF implementation https://github.com/tensorflow/addons/blob/v0.7.1/tensorflow_addons/losses/focal_loss.py
-        pred_prob = torch.sigmoid(pred)  # prob from logits
-        p_t = true * pred_prob + (1 - true) * (1 - pred_prob)
-        alpha_factor = true * self.alpha + (1 - true) * (1 - self.alpha)
-        modulating_factor = (1.0 - p_t) ** self.gamma
-        loss *= alpha_factor * modulating_factor
-
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:  # 'none'
-            return loss
-
 
 def topk(output, target, ks=(1,)):
   """Returns one boolean vector for each k, whether the target is within the output's top-k."""
@@ -205,8 +173,6 @@ def main(args):
   best_acc = -1
 
   logger = bit_common.setup_logger(args)
-  cp, cn = smooth_BCE(eps=0.1)
-
   # Lets cuDNN benchmark conv implementations and choose the fastest.
   # Only good if sizes stay the same within the main loop!
   torch.backends.cudnn.benchmark = True
@@ -217,11 +183,11 @@ def main(args):
   classes = 5
 
   train_set, valid_set, train_loader, valid_loader = mktrainval(args, logger)
-  print(len(train_loader))
   logger.info(f"Loading model from {args.model}.npz")
-  model = models.KNOWN_MODELS[args.model](head_size=classes, zero_head=True)
-  model.load_from(np.load(f"{args.model}.npz"))
+  #model = models.KNOWN_MODELS[args.model](head_size=classes, zero_head=True)
+  #model.load_from(np.load(f"{args.model}.npz"))
 
+  model = EfficientNet.from_pretrained(args.model, num_classes=classes)
   logger.info("Moving model onto all GPUs")
   model = torch.nn.DataParallel(model)
 
@@ -253,9 +219,7 @@ def main(args):
   model.train()
   mixup = bit_hyperrule.get_mixup(len(train_set))
   #mixup = -1
-  #cri = torch.nn.CrossEntropyLoss().to(device)
   cri = torch.nn.BCELoss().to(device)
-
   logger.info("Starting training!")
   chrono = lb.Chrono()
   accum_steps = 0
@@ -299,13 +263,17 @@ def main(args):
             # compute output
             with chrono.measure("fprop"):
               logits = model(x)
+              logits = F.softmax(logits, dim=1)
               top1, top5 = topk(logits, y, ks=(1, 5))
               all_top1.extend(top1.cpu())
               all_top5.extend(top5.cpu())
               if mixup > 0.0:
                 c = mixup_criterion(cri, logits, y_a, y_b, mixup_l)
               else:
-                c = cri(logits, y)
+                y_ = torch.full_like(logits, 0.1, device=device)
+                y_[range(y.shape[0]), y] = 0.9
+                c = cri(logits, y_)
+
             train_loss = c.item()
             train_acc  = np.mean(all_top1)*100.0
             # Accumulate grads
