@@ -221,10 +221,9 @@ def main(args):
   optim.zero_grad()
 
   model.train()
-  mixup = bit_hyperrule.get_mixup(len(train_set))
-  #mixup = -1
-  #cri = torch.nn.CrossEntropyLoss().to(device)
-  cri = torch.nn.BCELoss().to(device)
+  #mixup = bit_hyperrule.get_mixup(len(train_set))
+  mixup = -1
+  cri = torch.nn.CrossEntropyLoss().to(device)
 
   logger.info("Starting training!")
   chrono = lb.Chrono()
