@@ -21,22 +21,18 @@ import time
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torchvision as tv
 
 import fewshot as fs
 import lbtoolbox as lb
 import models
-import sys
+
 #import bit_pytorch.fewshot as fs
 #import bit_pytorch.lbtoolbox as lb
 #import bit_pytorch.models as models
 
 import bit_common
 import bit_hyperrule
-import tqdm
-from efficientnet_pytorch import EfficientNet
-import torch.nn.functional as F
 
 #from .. import bit_common, bit_hyperrule
 
@@ -64,15 +60,17 @@ def mktrainval(args, logger):
       #tv.transforms.Resize((precrop, precrop)),
       #tv.transforms.RandomCrop((crop, crop)),
       tv.transforms.RandomHorizontalFlip(),
-      tv.transforms.ToTensor(), 
-      tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      tv.transforms.ToTensor(),
+      #tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      tv.transforms.Normalize((0.43032281,0.49672744 , 0.3134248), (0.08504857, 0.08000449, 0.10248923)),
   ])
 
   val_tx = tv.transforms.Compose([
       tv.transforms.Resize((896, 896)),
       #tv.transforms.Resize((crop, crop)),
       tv.transforms.ToTensor(),
-      tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      tv.transforms.Normalize((0.43032281,0.49672744 , 0.3134248), (0.08504857, 0.08000449, 0.10248923)),
+      #tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
   ])
 
   if args.dataset == "cifar10":
@@ -118,7 +116,7 @@ def mktrainval(args, logger):
   return train_set, valid_set, train_loader, valid_loader
 
 
-def run_eval(model, data_loader, device, chrono, logger, epoch):
+def run_eval(model, data_loader, device, chrono, logger, step):
   # switch to evaluate mode
   model.eval()
 
@@ -148,11 +146,11 @@ def run_eval(model, data_loader, device, chrono, logger, epoch):
     end = time.time()
 
   model.train()
-  logger.info(f"Validation@{epoch} loss {np.mean(all_c):.5f}, "
+  logger.info(f"Validation@{step} loss {np.mean(all_c):.5f}, "
               f"top1 {np.mean(all_top1):.2%}, "
               f"top5 {np.mean(all_top5):.2%}")
   logger.flush()
-  return np.mean(all_c), np.mean(all_top1)*100.0
+  return all_c, all_top1, all_top5
 
 
 def mixup_data(x, y, l):
@@ -169,10 +167,8 @@ def mixup_criterion(criterion, pred, y_a, y_b, l):
 
 
 def main(args):
-
-  best_acc = -1
-
   logger = bit_common.setup_logger(args)
+
   # Lets cuDNN benchmark conv implementations and choose the fastest.
   # Only good if sizes stay the same within the main loop!
   torch.backends.cudnn.benchmark = True
@@ -183,6 +179,7 @@ def main(args):
   classes = 5
 
   train_set, valid_set, train_loader, valid_loader = mktrainval(args, logger)
+
   logger.info(f"Loading model from {args.model}.npz")
   model = models.KNOWN_MODELS[args.model](head_size=classes, zero_head=True)
   model.load_from(np.load(f"{args.model}.npz"))
@@ -193,7 +190,7 @@ def main(args):
   # Optionally resume from a checkpoint.
   # Load it to CPU first as we'll move the model to GPU later.
   # This way, we save a little bit of GPU memory when loading.
-  start_epoch = 0
+  step = 0
 
   # Note: no weight-decay!
   optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9)
@@ -205,10 +202,10 @@ def main(args):
     checkpoint = torch.load(savename, map_location="cpu")
     logger.info(f"Found saved model to resume from at '{savename}'")
 
-    start_epoch = checkpoint["epoch"]
+    step = checkpoint["step"]
     model.load_state_dict(checkpoint["model"])
     optim.load_state_dict(checkpoint["optim"])
-    logger.info(f"Resumed at epoch {start_epoch}")
+    logger.info(f"Resumed at step {step}")
   except FileNotFoundError:
     logger.info("Fine-tuning from BiT")
 
@@ -218,8 +215,7 @@ def main(args):
   model.train()
   mixup = bit_hyperrule.get_mixup(len(train_set))
   #mixup = -1
-  #cri = torch.nn.CrossEntropyLoss().to(device)
-  cri = torch.nn.BCELoss().to(device)
+  cri = torch.nn.CrossEntropyLoss().to(device)
 
   logger.info("Starting training!")
   chrono = lb.Chrono()
@@ -227,89 +223,70 @@ def main(args):
   mixup_l = np.random.beta(mixup, mixup) if mixup > 0 else 1
   end = time.time()
 
-  epoches = 20
-  scheduler = torch.optim.lr_scheduler.OneCycleLR(optim, max_lr=0.01, steps_per_epoch=1, epochs=epoches)
-
   with lb.Uninterrupt() as u:
-      for epoch in range(start_epoch, epoches):
+    for x, y in recycle(train_loader):
+      # measure data loading time, which is spent in the `for` statement.
+      chrono._done("load", time.time() - end)
 
-          pbar = enumerate(train_loader)
-          pbar = tqdm.tqdm(pbar, total=len(train_loader))
+      if u.interrupted:
+        break
 
-          scheduler.step()
-          all_top1, all_top5 = [], []
-          for param_group in optim.param_groups:
-              lr = param_group["lr"]
-          #for x, y in recycle(train_loader):
-          for batch_id, (x, y) in pbar:
-          #for batch_id, (x, y) in enumerate(train_loader):
-            # measure data loading time, which is spent in the `for` statement.
-            chrono._done("load", time.time() - end)
+      # Schedule sending to GPU(s)
+      x = x.to(device, non_blocking=True)
+      y = y.to(device, non_blocking=True)
 
-            if u.interrupted:
-              break
+      # Update learning-rate, including stop training if over.
+      lr = bit_hyperrule.get_lr(step, len(train_set), args.base_lr)
+      if lr is None:
+        break
+      for param_group in optim.param_groups:
+        param_group["lr"] = lr
 
-            # Schedule sending to GPU(s)
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
+      if mixup > 0.0:
+        x, y_a, y_b = mixup_data(x, y, mixup_l)
 
-            # Update learning-rate, including stop training if over.
-            #lr = bit_hyperrule.get_lr(step, len(train_set), args.base_lr)            
-            #if lr is None:
-            #  break
+      # compute output
+      with chrono.measure("fprop"):
+        logits = model(x)
+        if mixup > 0.0:
+          c = mixup_criterion(cri, logits, y_a, y_b, mixup_l)
+        else:
+          c = cri(logits, y)
+        c_num = float(c.data.cpu().numpy())  # Also ensures a sync point.
 
-            if mixup > 0.0:
-              x, y_a, y_b = mixup_data(x, y, mixup_l)
+      # Accumulate grads
+      with chrono.measure("grads"):
+        (c / args.batch_split).backward()
+        accum_steps += 1
 
-            # compute output
-            with chrono.measure("fprop"):
-              logits = model(x)
-              logits = F.softmax(logits, dim=1)
-              top1, top5 = topk(logits, y, ks=(1, 5))
-              all_top1.extend(top1.cpu())
-              all_top5.extend(top5.cpu())
-              if mixup > 0.0:
-                c = mixup_criterion(cri, logits, y_a, y_b, mixup_l)
-              else:
-                y_ = torch.full_like(logits, 0.1, device=device)
-                y_[range(y.shape[0]), y] = 0.6
-                c = cri(logits, y_)
+      accstep = f" ({accum_steps}/{args.batch_split})" if args.batch_split > 1 else ""
+      logger.info(f"[step {step}{accstep}]: loss={c_num:.5f} (lr={lr:.1e})")  # pylint: disable=logging-format-interpolation
+      logger.flush()
 
-            train_loss = c.item()
-            train_acc  = np.mean(all_top1)*100.0
-            # Accumulate grads
-            with chrono.measure("grads"):
-              (c / args.batch_split).backward()
-              accum_steps += 1
-            accstep = f"({accum_steps}/{args.batch_split})" if args.batch_split > 1 else ""
-            s = f"epoch={epoch} batch {batch_id}{accstep}: loss={train_loss:.5f} train_acc={train_acc:.2f} lr={lr:.1e}"
-            #s = f"epoch={epoch} batch {batch_id}{accstep}: loss={c.item():.5f} lr={lr:.1e}"
-            pbar.set_description(s)
-            #logger.info(f"[batch {batch_id}{accstep}]: loss={c_num:.5f} (lr={lr:.1e})")  # pylint: disable=logging-format-interpolation
-            logger.flush()
+      # Update params
+      if accum_steps == args.batch_split:
+        with chrono.measure("update"):
+          optim.step()
+          optim.zero_grad()
+        step += 1
+        accum_steps = 0
+        # Sample new mixup ratio for next batch
+        mixup_l = np.random.beta(mixup, mixup) if mixup > 0 else 1
 
-            # Update params
-            with chrono.measure("update"):
-                optim.step()
-                optim.zero_grad()
-            # Sample new mixup ratio for next batch
-            mixup_l = np.random.beta(mixup, mixup) if mixup > 0 else 1
+        # Run evaluation and save the model.
+        if args.eval_every and step % args.eval_every == 0:
+          run_eval(model, valid_loader, device, chrono, logger, step)
+          if args.save:
+            torch.save({
+                "step": step,
+                "model": model.state_dict(),
+                "optim" : optim.state_dict(),
+            }, savename)
 
-          # Run evaluation and save the model.
-          val_loss, val_acc = run_eval(model, valid_loader, device, chrono, logger, epoch)
+      end = time.time()
 
-          best = val_acc > best_acc
-          if best:
-              best_acc = val_acc
-              torch.save({
-                  "epoch": epoch,
-                  "val_loss": val_loss,
-                  "val_acc": val_acc,
-                  "train_acc": train_acc,
-                  "model": model.state_dict(),
-                  "optim" : optim.state_dict(),
-              }, savename)
-          end = time.time()
+    # Final eval at end of training.
+    run_eval(model, valid_loader, device, chrono, logger, step='end')
 
   logger.info(f"Timings:\n{chrono}")
 

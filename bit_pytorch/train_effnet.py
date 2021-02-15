@@ -98,14 +98,16 @@ def mktrainval(args, logger):
       tv.transforms.RandomCrop((crop, crop)),
       tv.transforms.RandomHorizontalFlip(),
       tv.transforms.ToTensor(), 
-      tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      #tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      tv.transforms.Normalize((0.43032281,0.49672744 , 0.3134248), (0.08504857, 0.08000449, 0.10248923)),
   ])
 
   val_tx = tv.transforms.Compose([
       #tv.transforms.Resize((896, 896)),
       tv.transforms.Resize((crop, crop)),
       tv.transforms.ToTensor(),
-      tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      #tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      tv.transforms.Normalize((0.43032281,0.49672744 , 0.3134248), (0.08504857, 0.08000449, 0.10248923)),
   ])
 
   if args.dataset == "cifar10":
