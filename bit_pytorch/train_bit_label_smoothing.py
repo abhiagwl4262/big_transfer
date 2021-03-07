@@ -273,8 +273,8 @@ def main(args):
               if mixup > 0.0:
                 c = mixup_criterion(cri, logits, y_a, y_b, mixup_l)
               else:
-                y_ = torch.full_like(logits, 0.1, device=device)
-                y_[range(y.shape[0]), y] = 0.6
+                y_ = torch.full_like(logits, 0.05, device=device)
+                y_[range(y.shape[0]), y] = 0.8
                 c = cri(logits, y_)
 
             train_loss = c.item()
