@@ -35,6 +35,11 @@ import sys
 import bit_common
 import bit_hyperrule
 import tqdm
+try:
+    from torch.cuda import amp
+    amp_train = True
+except:
+    amp_train = False
 
 #from .. import bit_common, bit_hyperrule
 
@@ -62,9 +67,8 @@ def mktrainval(args, logger):
   precrop, crop = bit_hyperrule.get_resolution_from_dataset(args.dataset)
 
   train_tx = tv.transforms.Compose([
-      tv.transforms.Resize((896, 896)),
-      #tv.transforms.Resize((precrop, precrop)),
-      #tv.transforms.RandomCrop((crop, crop)),
+      tv.transforms.Resize((precrop, precrop)),
+      tv.transforms.RandomCrop((crop, crop)),
       tv.transforms.RandomHorizontalFlip(),
       tv.transforms.ToTensor(), 
       #tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
@@ -72,8 +76,7 @@ def mktrainval(args, logger):
   ])
 
   val_tx = tv.transforms.Compose([
-      tv.transforms.Resize((896, 896)),
-      #tv.transforms.Resize((crop, crop)),
+      tv.transforms.Resize((crop, crop)),
       tv.transforms.ToTensor(),
       #tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
       tv.transforms.Normalize((0.43032281,0.49672744 , 0.3134248), (0.08504857, 0.08000449, 0.10248923)),
@@ -191,10 +194,10 @@ def main(args):
   train_set, valid_set, train_loader, valid_loader = mktrainval(args, logger)
   print(len(train_loader))
   logger.info(f"Loading model from {args.model}.npz")
-  #model = models.KNOWN_MODELS[args.model](head_size=classes, zero_head=True)
-  #model.load_from(np.load(f"{args.model}.npz"))
-  model = tv.models.resnet50(pretrained=True)
-  model.fc = torch.nn.Linear(in_features=model.fc.in_features, out_features=classes)
+  model = models.KNOWN_MODELS[args.model](head_size=classes, zero_head=True)
+  model.load_from(np.load(f"{args.model}.npz"))
+  #model = tv.models.resnet50(pretrained=True)
+  #model.fc = torch.nn.Linear(in_features=model.fc.in_features, out_features=classes)
   logger.info("Moving model onto all GPUs")
   model = torch.nn.DataParallel(model)
 
@@ -204,7 +207,7 @@ def main(args):
   start_epoch = 0
 
   # Note: no weight-decay!
-  optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9, weight_decay=5e-4)
+  optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9, weight_decay=1e-4)
 
   # Resume fine-tuning if we find a saved model.
   savename = pjoin(args.logdir, args.name, "bit.pth.tar")
@@ -219,22 +222,30 @@ def main(args):
     logger.info(f"Resumed at epoch {start_epoch}")
   except FileNotFoundError:
     logger.info("Fine-tuning from BiT")'''
-
   model = model.to(device)
-  optim.zero_grad()
+  chrono = lb.Chrono()
+  if args.weights:
+      model.load_state_dict(torch.load(args.weights)['model'])
+  if args.evaluate:
+      val_loss, val_acc = run_eval(model, valid_loader, device, chrono, logger, epoch=-1)
+      return
 
+  optim.zero_grad()
+  
   model.train()
   #mixup = bit_hyperrule.get_mixup(len(train_set))
   mixup = -1
   cri = torch.nn.CrossEntropyLoss().to(device)
 
   logger.info("Starting training!")
-  chrono = lb.Chrono()
   accum_steps = 0
   mixup_l = np.random.beta(mixup, mixup) if mixup > 0 else 1
   end = time.time()
 
-  epoches = 20
+  if amp_train:
+      cuda = device.type != 'cpu'
+      scaler = amp.GradScaler(enabled=cuda)
+  epoches = 10
   scheduler = torch.optim.lr_scheduler.OneCycleLR(optim, max_lr=0.01, steps_per_epoch=1, epochs=epoches)
 
   with lb.Uninterrupt() as u:
@@ -270,19 +281,31 @@ def main(args):
 
             # compute output
             with chrono.measure("fprop"):
-              logits = model(x)
-              top1, top5 = topk(logits, y, ks=(1, 5))
-              all_top1.extend(top1.cpu())
-              all_top5.extend(top5.cpu())
-              if mixup > 0.0:
-                c = mixup_criterion(cri, logits, y_a, y_b, mixup_l)
-              else:
-                c = cri(logits, y)
+                if amp_train:
+                    with amp.autocast(enabled=cuda):
+                        logits = model(x)
+                        if mixup > 0.0:
+                            c = mixup_criterion(cri, logits, y_a, y_b, mixup_l)
+                        else:
+                            c = cri(logits, y)
+                else:
+                    logits = model(x)
+                    if mixup > 0.0:
+                        c = mixup_criterion(cri, logits, y_a, y_b, mixup_l)
+                    else:
+                        c = cri(logits, y)
+
+            top1, top5 = topk(logits, y, ks=(1, 5))
+            all_top1.extend(top1.cpu())
+            all_top5.extend(top5.cpu())
             train_loss = c.item()
             train_acc  = np.mean(all_top1)*100.0
             # Accumulate grads
             with chrono.measure("grads"):
-              (c / args.batch_split).backward()
+              if amp_train:
+                  scaler.scale(c / args.batch_split).backward()
+              else:
+                  (c / args.batch_split).backward()
               accum_steps += 1
             accstep = f"({accum_steps}/{args.batch_split})" if args.batch_split > 1 else ""
             s = f"epoch={epoch} batch {batch_id}{accstep}: loss={train_loss:.5f} train_acc={train_acc:.2f} lr={lr:.1e}"
@@ -293,7 +316,11 @@ def main(args):
 
             # Update params
             with chrono.measure("update"):
-                optim.step()
+                if amp_train:
+                    scaler.step(optim)  # optimizer.step
+                    scaler.update()
+                else:
+                    optim.step()
                 optim.zero_grad()
             # Sample new mixup ratio for next batch
             mixup_l = np.random.beta(mixup, mixup) if mixup > 0 else 1
@@ -324,4 +351,6 @@ if __name__ == "__main__":
   parser.add_argument("--workers", type=int, default=8,
                       help="Number of background threads used to load data.")
   parser.add_argument("--no-save", dest="save", action="store_false")
+  parser.add_argument("--evaluate", action="store_true")
+  parser.add_argument("--weights", type=str, required=False)
   main(parser.parse_args())
