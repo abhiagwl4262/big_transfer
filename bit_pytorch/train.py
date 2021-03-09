@@ -36,6 +36,7 @@ import bit_common
 import bit_hyperrule
 import tqdm
 from sklearn.metrics import confusion_matrix
+from datasets import ImageFolder
 
 try:
     from torch.cuda import amp
@@ -91,8 +92,10 @@ def mktrainval(args, logger):
     train_set = tv.datasets.CIFAR100(args.datadir, transform=train_tx, train=True, download=True)
     valid_set = tv.datasets.CIFAR100(args.datadir, transform=val_tx, train=False, download=True)
   elif args.dataset == "imagenet2012":
-    train_set = tv.datasets.ImageFolder(pjoin(args.datadir, "train"), train_tx)
-    valid_set = tv.datasets.ImageFolder(pjoin(args.datadir, "val"), val_tx)
+    train_set = ImageFolder(pjoin(args.datadir, "train"), train_tx, crop)
+    valid_set = ImageFolder(pjoin(args.datadir, "val"), val_tx, crop)
+    #train_set = tv.datasets.ImageFolder(pjoin(args.datadir, "train"), train_tx)
+    #valid_set = tv.datasets.ImageFolder(pjoin(args.datadir, "val"), val_tx)
   else:
     raise ValueError(f"Sorry, we have not spent time implementing the "
                      f"{args.dataset} dataset in the PyTorch codebase. "
@@ -138,7 +141,7 @@ def run_eval(model, data_loader, device, chrono, logger, epoch, num_classes):
   end = time.time()
   preds = []
   gts   = []
-  for b, (x, y) in enumerate(data_loader):
+  for b, (path, x, y) in enumerate(data_loader):
     with torch.no_grad():
       x = x.to(device, non_blocking=True)
       y = y.to(device, non_blocking=True)
