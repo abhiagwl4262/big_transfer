@@ -35,6 +35,8 @@ import sys
 import bit_common
 import bit_hyperrule
 import tqdm
+from sklearn.metrics import confusion_matrix
+
 try:
     from torch.cuda import amp
     amp_train = True
@@ -125,7 +127,7 @@ def mktrainval(args, logger):
   return train_set, valid_set, train_loader, valid_loader
 
 
-def run_eval(model, data_loader, device, chrono, logger, epoch):
+def run_eval(model, data_loader, device, chrono, logger, epoch, num_classes):
   # switch to evaluate mode
   model.eval()
 
@@ -134,6 +136,8 @@ def run_eval(model, data_loader, device, chrono, logger, epoch):
 
   all_c, all_top1, all_top5 = [], [], []
   end = time.time()
+  preds = []
+  gts   = []
   for b, (x, y) in enumerate(data_loader):
     with torch.no_grad():
       x = x.to(device, non_blocking=True)
@@ -145,6 +149,9 @@ def run_eval(model, data_loader, device, chrono, logger, epoch):
       # compute output, measure accuracy and record loss.
       with chrono.measure("eval fprop"):
         logits = model(x)
+        _, preds_ = torch.max(logits, 1)
+        preds.append(preds_.cpu().numpy())
+        gts.append(y.cpu().numpy())
         c = torch.nn.CrossEntropyLoss(reduction='none')(logits, y)
         top1, top5 = topk(logits, y, ks=(1, 5))
         all_c.extend(c.cpu())  # Also ensures a sync point.
@@ -154,6 +161,12 @@ def run_eval(model, data_loader, device, chrono, logger, epoch):
     # measure elapsed time
     end = time.time()
 
+  preds = [item for sublist in preds for item in sublist]
+  gts   = [item for sublist in gts   for item in sublist]
+  preds = np.array(preds)
+  gts   = np.array(gts)
+  print("Cij  is equal to the number of observations known to be in group i and predicted to be in group j")
+  print(confusion_matrix(gts, preds))
   model.train()
   logger.info(f"Validation@{epoch} loss {np.mean(all_c):.5f}, "
               f"top1 {np.mean(all_top1):.2%}, "
@@ -227,7 +240,7 @@ def main(args):
   if args.weights:
       model.load_state_dict(torch.load(args.weights)['model'])
   if args.evaluate:
-      val_loss, val_acc = run_eval(model, valid_loader, device, chrono, logger, epoch=-1)
+      val_loss, val_acc = run_eval(model, valid_loader, device, chrono, logger, -1, classes)
       return
 
   optim.zero_grad()
@@ -247,7 +260,7 @@ def main(args):
       scaler = amp.GradScaler(enabled=cuda)
   epoches = 10
   scheduler = torch.optim.lr_scheduler.OneCycleLR(optim, max_lr=0.01, steps_per_epoch=1, epochs=epoches)
-
+  
   with lb.Uninterrupt() as u:
       for epoch in range(start_epoch, epoches):
 
@@ -326,7 +339,7 @@ def main(args):
             mixup_l = np.random.beta(mixup, mixup) if mixup > 0 else 1
 
           # Run evaluation and save the model.
-          val_loss, val_acc = run_eval(model, valid_loader, device, chrono, logger, epoch)
+          val_loss, val_acc = run_eval(model, valid_loader, device, chrono, logger, epoch, classes)
 
           best = val_acc > best_acc
           if best:
