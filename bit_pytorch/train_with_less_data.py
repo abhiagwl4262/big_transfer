@@ -38,6 +38,7 @@ import tqdm
 from sklearn.metrics import confusion_matrix
 from datasets import ImageFolder
 import torch.nn.functional as F
+import glob
 
 try:
     from torch.cuda import amp
@@ -93,8 +94,16 @@ def mktrainval(args, logger):
     train_set = tv.datasets.CIFAR100(args.datadir, transform=train_tx, train=True, download=True)
     valid_set = tv.datasets.CIFAR100(args.datadir, transform=val_tx, train=False, download=True)
   elif args.dataset == "imagenet2012":
-    train_set = ImageFolder(pjoin(args.datadir, "train"), train_tx, crop)
-    valid_set = ImageFolder(pjoin(args.datadir, "val"), val_tx, crop)
+
+    folder_path = pjoin(args.datadir, "train")
+    files  = sorted(glob.glob("%s/*/*.*" % folder_path))
+    labels = [int(file.split("/")[-2]) for file in files]
+    train_set = ImageFolder(files, labels, train_tx, crop)
+
+    folder_path = pjoin(args.datadir, "val")
+    files  = sorted(glob.glob("%s/*/*.*" % folder_path))
+    labels = [int(file.split("/")[-2]) for file in files]
+    valid_set = ImageFolder(files, labels, val_tx, crop)
     #train_set = tv.datasets.ImageFolder(pjoin(args.datadir, "train"), train_tx)
     #valid_set = tv.datasets.ImageFolder(pjoin(args.datadir, "val"), val_tx)
   else:
@@ -130,6 +139,56 @@ def mktrainval(args, logger):
 
   return train_set, valid_set, train_loader, valid_loader
 
+def select_worst_images(args, model, full_train_loader, device):
+  model.eval()
+     
+  gts   = []
+  paths = []
+  losses= []
+
+  micro_batch_size = args.batch_size // args.batch_split
+  precrop, crop = bit_hyperrule.get_resolution_from_dataset(args.dataset)
+
+  train_tx = tv.transforms.Compose([
+      tv.transforms.Resize((precrop, precrop)),
+      tv.transforms.RandomCrop((crop, crop)),
+      tv.transforms.RandomHorizontalFlip(),
+      tv.transforms.ToTensor(),
+      #tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      tv.transforms.Normalize((0.43032281,0.49672744 , 0.3134248), (0.08504857, 0.08000449, 0.10248923)),
+  ])
+  for b, (path, x, y) in enumerate(full_train_loader):
+    with torch.no_grad():
+      x = x.to(device, non_blocking=True)
+      y = y.to(device, non_blocking=True)
+
+
+      # compute output, measure accuracy and record loss.
+      logits = model(x)
+    
+      paths.extend(path)
+      gts.extend(y.cpu().numpy())
+
+      c = torch.nn.CrossEntropyLoss(reduction='none')(logits, y)
+
+      losses.extend(c.cpu().numpy().tolist())  # Also ensures a sync point.
+
+    # measure elapsed time
+    end = time.time()
+
+  gts    = np.array(gts)
+  losses = np.array(losses)
+  losses[np.argsort(losses)[int(losses.shape[0]*0.95):]] = 0.0
+
+  paths_ = np.array(paths)[np.where(losses > np.median(losses))[0]]
+  gts_   = gts[np.where(losses > np.median(losses))[0]]
+  smart_train_set = ImageFolder(paths_, gts_, train_tx, crop)
+
+  smart_train_loader = torch.utils.data.DataLoader(
+          smart_train_set, batch_size=micro_batch_size, shuffle=True,
+          num_workers=args.workers, pin_memory=True, drop_last=False)
+
+  return smart_train_set, smart_train_loader
 
 def run_eval(model, data_loader, device, chrono, logger, epoch, num_classes):
   # switch to evaluate mode
@@ -140,8 +199,10 @@ def run_eval(model, data_loader, device, chrono, logger, epoch, num_classes):
 
   all_c, all_top1, all_top5 = [], [], []
   end = time.time()
+
   preds = []
   gts   = []
+
   for b, (path, x, y) in enumerate(data_loader):
     with torch.no_grad():
       x = x.to(device, non_blocking=True)
@@ -153,26 +214,28 @@ def run_eval(model, data_loader, device, chrono, logger, epoch, num_classes):
       # compute output, measure accuracy and record loss.
       with chrono.measure("eval fprop"):
         logits = model(x)
+
         _, preds_ = torch.max(logits, 1)
     
-        preds.append(preds_.cpu().numpy())
-        gts.append(y.cpu().numpy())
+        preds.extend(preds_.cpu().numpy())
+        gts.extend(y.cpu().numpy())
+
         c = torch.nn.CrossEntropyLoss(reduction='none')(logits, y)
+
         top1, top5 = topk(logits, y, ks=(1, 5))
-        all_c.extend(c.cpu())  # Also ensures a sync point.
+        all_c.extend(c.cpu().numpy().tolist())  # Also ensures a sync point.
         all_top1.extend(top1.cpu())
         all_top5.extend(top5.cpu())
 
     # measure elapsed time
     end = time.time()
 
-  preds = [item for sublist in preds for item in sublist]
-  gts   = [item for sublist in gts   for item in sublist]
   preds = np.array(preds)
   gts   = np.array(gts)
+
   print("Cij  is equal to the number of observations known to be in group i and predicted to be in group j")
   print(confusion_matrix(gts, preds))
-  model.train()
+
   logger.info(f"Validation@{epoch} loss {np.mean(all_c):.5f}, "
               f"top1 {np.mean(all_top1):.2%}, "
               f"top5 {np.mean(all_top5):.2%}")
@@ -263,22 +326,31 @@ def main(args):
   if amp_train:
       cuda = device.type != 'cpu'
       scaler = amp.GradScaler(enabled=cuda)
-  epoches = 10
+  epoches = args.epochs 
   scheduler = torch.optim.lr_scheduler.OneCycleLR(optim, max_lr=0.01, steps_per_epoch=1, epochs=epoches)
-  
+
+
   with lb.Uninterrupt() as u:
       for epoch in range(start_epoch, epoches):
-
-          pbar = enumerate(train_loader)
-          pbar = tqdm.tqdm(pbar, total=len(train_loader))
+          
+          model.train()
+          
+          if epoch == 0:
+              pbar = enumerate(train_loader)
+              pbar = tqdm.tqdm(pbar, total=len(train_loader))
+          else:
+              pbar = enumerate(smart_train_loader)
+              pbar = tqdm.tqdm(pbar, total=len(smart_train_loader))
 
           scheduler.step()
           all_top1, all_top5 = [], []
           for param_group in optim.param_groups:
               lr = param_group["lr"]
           #for x, y in recycle(train_loader):
-          for batch_id, (path, x, y) in pbar:
           #for batch_id, (x, y) in enumerate(train_loader):
+          for batch_id, (path, x, y) in pbar:
+
+
             # measure data loading time, which is spent in the `for` statement.
             chrono._done("load", time.time() - end)
 
@@ -345,6 +417,7 @@ def main(args):
 
           # Run evaluation and save the model.
           val_loss, val_acc = run_eval(model, valid_loader, device, chrono, logger, epoch, classes)
+          _, smart_train_loader = select_worst_images(args, model, train_loader, device)
 
           best = val_acc > best_acc
           if best:
@@ -371,4 +444,5 @@ if __name__ == "__main__":
   parser.add_argument("--no-save", dest="save", action="store_false")
   parser.add_argument("--evaluate", action="store_true")
   parser.add_argument("--weights", type=str, required=False)
+  parser.add_argument("--epochs", type=int, required=False)
   main(parser.parse_args())

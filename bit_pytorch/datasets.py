@@ -37,9 +37,12 @@ def random_resize(images, min_size=288, max_size=448):
 
 
 class ImageFolder(Dataset):
-    def __init__(self, folder_path, transform, img_size=416):
-        self.files  = sorted(glob.glob("%s/*/*.*" % folder_path))
-        self.labels = [int(file.split("/")[-2]) for file in self.files]
+    def __init__(self, files, labels, transform, img_size=416):
+        self.files = files
+        self.labels= labels
+    #def __init__(self, folder_path, transform, img_size=416):
+        #self.files  = sorted(glob.glob("%s/*/*.*" % folder_path))
+        #self.labels = [int(file.split("/")[-2]) for file in self.files]
         self.zipped = list(zip(self.files, self.labels))
         random.shuffle(self.zipped)
         self.img_size = img_size
