@@ -110,14 +110,14 @@ class PreActBottleneck(nn.Module):
 class ResNetV2(nn.Module):
   """Implementation of Pre-activation (v2) ResNet mode."""
 
-  def __init__(self, block_units, width_factor, head_size=21843, zero_head=False):
+  def __init__(self, block_units, width_factor, head_size=21843, zero_head=False, image_channels=3):
     super().__init__()
     wf = width_factor  # shortcut 'cause we'll use it a lot.
 
     # The following will be unreadable if we split lines.
     # pylint: disable=line-too-long
     self.root = nn.Sequential(OrderedDict([
-        ('conv', StdConv2d(3, 64*wf, kernel_size=7, stride=2, padding=3, bias=False)),
+        ('conv', StdConv2d(image_channels, 64*wf, kernel_size=7, stride=2, padding=3, bias=False)),
         ('pad', nn.ConstantPad2d(1, 0)),
         ('pool', nn.MaxPool2d(kernel_size=3, stride=2, padding=0)),
         # The following is subtly not the same!
@@ -157,9 +157,9 @@ class ResNetV2(nn.Module):
     assert x.shape[-2:] == (1, 1)  # We should have no spatial shape left.
     return x[...,0,0]
 
-  def load_from(self, weights, prefix='resnet/'):
+  def load_from(self, weights, prefix='resnet/', image_channels=3):
     with torch.no_grad():
-      self.root.conv.weight.copy_(tf2th(weights[f'{prefix}root_block/standardized_conv2d/kernel']))  # pylint: disable=line-too-long
+      self.root.conv.weight.copy_(tf2th(weights[f'{prefix}root_block/standardized_conv2d/kernel'])[:,0:image_channels,:,:])  # pylint: disable=line-too-long
       self.head.gn.weight.copy_(tf2th(weights[f'{prefix}group_norm/gamma']))
       self.head.gn.bias.copy_(tf2th(weights[f'{prefix}group_norm/beta']))
       if self.zero_head:
