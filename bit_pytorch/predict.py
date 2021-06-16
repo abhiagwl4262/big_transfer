@@ -133,17 +133,21 @@ def mixup_criterion(criterion, pred, y_a, y_b, l):
   return l * criterion(pred, y_a) + (1 - l) * criterion(pred, y_b)
 
 def run_predict(model, test_path, data_transform, device):
+
+    class_dict = {"0":"mercedes", "1":"redbull" }
+
     f_write = open("submission.csv", "a")
-    f_write.write('image_id,label\n')
+    f_write.write('ImageID,label\n')
     img_paths = [img for img in os.listdir(test_path)]
     for path in img_paths:
+        print("working on %s" % path)
         img_path = os.path.join(test_path,path)
         img      = Image.open(img_path)
         img      = data_transform(img)
 
         pred     = model(img.unsqueeze(0))
         class_id = torch.argmax(pred).item()
-        f_write.write(path + "," + str(class_id) + "\n")
+        f_write.write(path.split(".")[0] + "," + class_dict[str(class_id)] + "\n")
 
     f_write.close()
 def main(args):
