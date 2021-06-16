@@ -38,6 +38,7 @@ import tqdm
 from sklearn.metrics import confusion_matrix
 from datasets import ImageFolder
 import torch.nn.functional as F
+import glob
 
 try:
     from torch.cuda import amp
@@ -47,6 +48,8 @@ except:
 
 #from .. import bit_common, bit_hyperrule
 
+#class_dict = {"mercedes" : 0, "redbull" : 1}
+class_dict = {"negative":0, "typical" :1, "indeterminate":2, "atypical":3}
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
     # return positive, negative label smoothing BCE targets
     return 1.0 - 0.5 * eps, 0.5 * eps
@@ -70,31 +73,71 @@ def mktrainval(args, logger):
   """Returns train and validation datasets."""
   precrop, crop = bit_hyperrule.get_resolution_from_dataset(args.dataset)
 
-  train_tx = tv.transforms.Compose([
-      tv.transforms.Resize((precrop, precrop)),
-      tv.transforms.RandomCrop((crop, crop)),
-      tv.transforms.RandomHorizontalFlip(),
-      tv.transforms.ToTensor(), 
-      #tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-      tv.transforms.Normalize((0.43032281,0.49672744 , 0.3134248), (0.08504857, 0.08000449, 0.10248923)),
-  ])
+  if args.input_channels == 3:
+      train_tx = tv.transforms.Compose([
+          tv.transforms.Resize((precrop, precrop)),
+          tv.transforms.RandomCrop((crop, crop)),
+          tv.transforms.RandomHorizontalFlip(),
+          tv.transforms.ToTensor(), 
+          tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      ])
 
-  val_tx = tv.transforms.Compose([
-      tv.transforms.Resize((crop, crop)),
-      tv.transforms.ToTensor(),
-      #tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-      tv.transforms.Normalize((0.43032281,0.49672744 , 0.3134248), (0.08504857, 0.08000449, 0.10248923)),
-  ])
+      val_tx = tv.transforms.Compose([
+          tv.transforms.Resize((crop, crop)),
+          tv.transforms.ToTensor(),
+          tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      ])
 
+  elif args.input_channels == 2:
+      train_tx = tv.transforms.Compose([
+          tv.transforms.Resize((precrop, precrop)),
+          tv.transforms.RandomCrop((crop, crop)),
+          tv.transforms.RandomHorizontalFlip(),
+          tv.transforms.ToTensor(), 
+          tv.transforms.Normalize((0.5, 0.5), (0.5, 0.5)),
+      ])
+    
+      val_tx = tv.transforms.Compose([
+          tv.transforms.Resize((crop, crop)),
+          tv.transforms.ToTensor(),
+          tv.transforms.Normalize((0.5, 0.5), (0.5, 0.5)),
+      ])
+    
+  elif args.input_channels == 1:
+      train_tx = tv.transforms.Compose([
+          tv.transforms.Resize((precrop, precrop)),
+          tv.transforms.RandomCrop((crop, crop)),
+          tv.transforms.RandomHorizontalFlip(),
+          tv.transforms.ToTensor(), 
+          tv.transforms.Normalize((0.5), (0.5)),
+      ])
+    
+      val_tx = tv.transforms.Compose([
+          tv.transforms.Resize((crop, crop)),
+          tv.transforms.ToTensor(),
+          tv.transforms.Normalize((0.5), (0.5)),
+      ])
+    
   if args.dataset == "cifar10":
     train_set = tv.datasets.CIFAR10(args.datadir, transform=train_tx, train=True, download=True)
     valid_set = tv.datasets.CIFAR10(args.datadir, transform=val_tx, train=False, download=True)
   elif args.dataset == "cifar100":
     train_set = tv.datasets.CIFAR100(args.datadir, transform=train_tx, train=True, download=True)
     valid_set = tv.datasets.CIFAR100(args.datadir, transform=val_tx, train=False, download=True)
+
   elif args.dataset == "imagenet2012":
-    train_set = ImageFolder(pjoin(args.datadir, "train"), train_tx, crop)
-    valid_set = ImageFolder(pjoin(args.datadir, "val"), val_tx, crop)
+
+    folder_path = pjoin(args.datadir, "train")
+    files  = sorted(glob.glob("%s/*/*.*" % folder_path))
+    #labels = [int(file.split("/")[-2]) for file in files]
+    labels = [class_dict[file.split("/")[-2]] for file in files]
+    train_set = ImageFolder(files, labels, train_tx, crop)
+
+    folder_path = pjoin(args.datadir, "val")
+    files  = sorted(glob.glob("%s/*/*.*" % folder_path))
+    #labels = [int(file.split("/")[-2]) for file in files]
+    labels = [class_dict[file.split("/")[-2]] for file in files]
+    valid_set = ImageFolder(files, labels, val_tx, crop)
     #train_set = tv.datasets.ImageFolder(pjoin(args.datadir, "train"), train_tx)
     #valid_set = tv.datasets.ImageFolder(pjoin(args.datadir, "val"), val_tx)
   else:
@@ -111,14 +154,18 @@ def mktrainval(args, logger):
   logger.info(f"Using a validation set with {len(valid_set)} images.")
 
   micro_batch_size = args.batch_size // args.batch_split
+  micro_batch_size_val = 4*micro_batch_size
 
   valid_loader = torch.utils.data.DataLoader(
-      valid_set, batch_size=micro_batch_size, shuffle=False,
+      valid_set, batch_size=micro_batch_size_val, shuffle=False,
       num_workers=args.workers, pin_memory=True, drop_last=False)
 
   if micro_batch_size <= len(train_set):
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=micro_batch_size, shuffle=True,
+        num_workers=args.workers, pin_memory=True, drop_last=False)
+    train_loader_val = torch.utils.data.DataLoader(
+        train_set, batch_size=micro_batch_size_val, shuffle=True,
         num_workers=args.workers, pin_memory=True, drop_last=False)
   else:
     # In the few-shot cases, the total dataset size might be smaller than the batch-size.
@@ -128,8 +175,85 @@ def mktrainval(args, logger):
         train_set, batch_size=micro_batch_size, num_workers=args.workers, pin_memory=True,
         sampler=torch.utils.data.RandomSampler(train_set, replacement=True, num_samples=micro_batch_size))
 
-  return train_set, valid_set, train_loader, valid_loader
+  return train_set, valid_set, train_loader, valid_loader, train_loader_val
 
+def select_worst_images(args, model, full_train_loader, device):
+  print("Selecting images for next epoch training...")
+  model.eval()
+     
+  gts   = []
+  paths = []
+  losses= []
+
+  micro_batch_size = args.batch_size // args.batch_split
+  precrop, crop = bit_hyperrule.get_resolution_from_dataset(args.dataset)
+
+  if args.input_channels ==3:
+      train_tx = tv.transforms.Compose([
+          tv.transforms.Resize((precrop, precrop)),
+          tv.transforms.RandomCrop((crop, crop)),
+          tv.transforms.RandomHorizontalFlip(),
+          tv.transforms.ToTensor(),
+          tv.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+      ])
+  elif args.input_channels ==2:
+      train_tx = tv.transforms.Compose([
+          tv.transforms.Resize((precrop, precrop)),
+          tv.transforms.RandomCrop((crop, crop)),
+          tv.transforms.RandomHorizontalFlip(),
+          tv.transforms.ToTensor(),
+          tv.transforms.Normalize((0.5, 0.5), (0.5, 0.5)),
+      ])
+
+  elif args.input_channels ==1:
+      train_tx = tv.transforms.Compose([
+          tv.transforms.Resize((precrop, precrop)),
+          tv.transforms.RandomCrop((crop, crop)),
+          tv.transforms.RandomHorizontalFlip(),
+          tv.transforms.ToTensor(),
+          tv.transforms.Normalize((0.5), (0.5)),
+      ])
+    
+  pbar = enumerate(full_train_loader)
+  pbar = tqdm.tqdm(pbar, total=len(full_train_loader))
+
+  for b, (path, x, y) in pbar:
+    with torch.no_grad():
+      x = x.to(device, non_blocking=True)
+      y = y.to(device, non_blocking=True)
+
+
+      # compute output, measure accuracy and record loss.
+      logits = model(x)
+    
+      paths.extend(path)
+      gts.extend(y.cpu().numpy())
+
+      c = torch.nn.CrossEntropyLoss(reduction='none')(logits, y)
+
+      losses.extend(c.cpu().numpy().tolist())  # Also ensures a sync point.
+
+    # measure elapsed time
+    end = time.time()
+
+  gts    = np.array(gts)
+  losses = np.array(losses)
+  losses[np.argsort(losses)[int(losses.shape[0]*(1.0 - args.noise)):]] = 0.0#
+  
+  #paths_ = np.array(paths)[np.where(losses > np.median(losses))[0]]
+  #gts_   = gts[np.where(losses > np.median(losses))[0]]
+
+  selection_idx = int(args.data_fraction*losses.shape[0])
+  paths_ = np.array(paths)[np.argsort(losses)[-selection_idx:]]
+  gts_   = gts[np.argsort(losses)[-selection_idx:]]
+
+  smart_train_set = ImageFolder(paths_, gts_, train_tx, crop)
+
+  smart_train_loader = torch.utils.data.DataLoader(
+          smart_train_set, batch_size=micro_batch_size, shuffle=True,
+          num_workers=args.workers, pin_memory=True, drop_last=False)
+
+  return smart_train_set, smart_train_loader
 
 def run_eval(model, data_loader, device, chrono, logger, epoch, num_classes):
   # switch to evaluate mode
@@ -140,9 +264,13 @@ def run_eval(model, data_loader, device, chrono, logger, epoch, num_classes):
 
   all_c, all_top1, all_top5 = [], [], []
   end = time.time()
+
   preds = []
   gts   = []
-  for b, (path, x, y) in enumerate(data_loader):
+  pbar = enumerate(data_loader)
+  pbar = tqdm.tqdm(pbar, total=len(data_loader))
+
+  for b, (path, x, y) in pbar:
     with torch.no_grad():
       x = x.to(device, non_blocking=True)
       y = y.to(device, non_blocking=True)
@@ -153,29 +281,29 @@ def run_eval(model, data_loader, device, chrono, logger, epoch, num_classes):
       # compute output, measure accuracy and record loss.
       with chrono.measure("eval fprop"):
         logits = model(x)
+
         _, preds_ = torch.max(logits, 1)
     
-        preds.append(preds_.cpu().numpy())
-        gts.append(y.cpu().numpy())
+        preds.extend(preds_.cpu().numpy())
+        gts.extend(y.cpu().numpy())
+
         c = torch.nn.CrossEntropyLoss(reduction='none')(logits, y)
-        top1, top5 = topk(logits, y, ks=(1, 5))
-        all_c.extend(c.cpu())  # Also ensures a sync point.
+
+        top1 = topk(logits, y, ks=(1,))[0]
+        all_c.extend(c.cpu().numpy().tolist())  # Also ensures a sync point.
         all_top1.extend(top1.cpu())
-        all_top5.extend(top5.cpu())
 
     # measure elapsed time
     end = time.time()
 
-  preds = [item for sublist in preds for item in sublist]
-  gts   = [item for sublist in gts   for item in sublist]
   preds = np.array(preds)
   gts   = np.array(gts)
+
   print("Cij  is equal to the number of observations known to be in group i and predicted to be in group j")
   print(confusion_matrix(gts, preds))
-  model.train()
+
   logger.info(f"Validation@{epoch} loss {np.mean(all_c):.5f}, "
-              f"top1 {np.mean(all_top1):.2%}, "
-              f"top5 {np.mean(all_top5):.2%}")
+              f"top1 {np.mean(all_top1):.2%}, ")
   logger.flush()
   return np.mean(all_c), np.mean(all_top1)*100.0
 
@@ -207,13 +335,13 @@ def main(args):
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   logger.info(f"Going to train on {device}")
 
-  classes = 5
+  classes = args.classes
 
-  train_set, valid_set, train_loader, valid_loader = mktrainval(args, logger)
+  train_set, valid_set, train_loader, valid_loader, train_loader_val = mktrainval(args, logger)
   print(len(train_loader))
   logger.info(f"Loading model from {args.model}.npz")
-  model = models.KNOWN_MODELS[args.model](head_size=classes, zero_head=True)
-  model.load_from(np.load(f"{args.model}.npz"))
+  model = models.KNOWN_MODELS[args.model](head_size=classes, zero_head=True, image_channels=args.input_channels)
+  model.load_from(np.load(f"{args.model}.npz"), image_channels=args.input_channels)
   #model = tv.models.resnet50(pretrained=True)
   #model.fc = torch.nn.Linear(in_features=model.fc.in_features, out_features=classes)
   logger.info("Moving model onto all GPUs")
@@ -225,7 +353,7 @@ def main(args):
   start_epoch = 0
 
   # Note: no weight-decay!
-  optim = torch.optim.SGD(model.parameters(), lr=0.003, momentum=0.9, weight_decay=1e-4)
+  optim = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
 
   # Resume fine-tuning if we find a saved model.
   savename = pjoin(args.logdir, args.name, "bit.pth.tar")
@@ -263,22 +391,32 @@ def main(args):
   if amp_train:
       cuda = device.type != 'cpu'
       scaler = amp.GradScaler(enabled=cuda)
-  epoches = 10
+  epoches = args.epochs 
   scheduler = torch.optim.lr_scheduler.OneCycleLR(optim, max_lr=0.01, steps_per_epoch=1, epochs=epoches)
-  
+  #scheduler = torch.optim.lr_scheduler.StepLR(optim, step_size=10, gamma=0.1)
+
+
   with lb.Uninterrupt() as u:
       for epoch in range(start_epoch, epoches):
-
+          
+          model.train()
+          
           pbar = enumerate(train_loader)
           pbar = tqdm.tqdm(pbar, total=len(train_loader))
+          '''else:
+              pbar = enumerate(smart_train_loader)
+              pbar = tqdm.tqdm(pbar, total=len(smart_train_loader))
+          '''
 
           scheduler.step()
           all_top1, all_top5 = [], []
           for param_group in optim.param_groups:
               lr = param_group["lr"]
           #for x, y in recycle(train_loader):
-          for batch_id, (path, x, y) in pbar:
           #for batch_id, (x, y) in enumerate(train_loader):
+          for batch_id, (path, x, y) in pbar:
+
+
             # measure data loading time, which is spent in the `for` statement.
             chrono._done("load", time.time() - end)
 
@@ -313,9 +451,8 @@ def main(args):
                     else:
                         c = cri(logits, y)
 
-            top1, top5 = topk(logits, y, ks=(1, 5))
+            top1 = topk(logits, y, ks=(1, ))[0]
             all_top1.extend(top1.cpu())
-            all_top5.extend(top5.cpu())
             train_loss = c.item()
             train_acc  = np.mean(all_top1)*100.0
             # Accumulate grads
@@ -345,6 +482,8 @@ def main(args):
 
           # Run evaluation and save the model.
           val_loss, val_acc = run_eval(model, valid_loader, device, chrono, logger, epoch, classes)
+          if args.smart_train:
+              _, train_loader = select_worst_images(args, model, train_loader_val, device)
 
           best = val_acc > best_acc
           if best:
@@ -370,5 +509,12 @@ if __name__ == "__main__":
                       help="Number of background threads used to load data.")
   parser.add_argument("--no-save", dest="save", action="store_false")
   parser.add_argument("--evaluate", action="store_true")
+  parser.add_argument("--smart_train", action="store_true")
   parser.add_argument("--weights", type=str, required=False)
+  parser.add_argument("--epochs", type=int, required=True)
+  parser.add_argument("--classes", type=int, required=True)
+  parser.add_argument("--input_channels", type=int, required=True)
+  parser.add_argument('--noise', type=float, default=0.02, help='range is 0.0-1.0, The measure of noise that can present in the data')
+  parser.add_argument('--data_fraction', type=float, default=0.5, help=' How much of the training data need to be used during training')
+
   main(parser.parse_args())
